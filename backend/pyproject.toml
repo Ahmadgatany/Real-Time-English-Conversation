@@ -1,0 +1,28 @@
+[project]
+name = "real-time-english-conversation-backend"
+version = "0.1.0"
+description = "FastAPI service for the English speaking platform"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "sqlalchemy",
+    "aiosqlite",
+    "PyJWT",
+    "email-validator",
+    "redis"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+    "ruff"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

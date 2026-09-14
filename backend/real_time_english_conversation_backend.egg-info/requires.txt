@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+httpx
+sqlalchemy
+aiosqlite
+PyJWT
+email-validator
+redis
+
+[dev]
+pytest
+httpx
+ruff
