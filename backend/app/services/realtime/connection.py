@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.services.ai.providers import GeminiProvider, GeminiProviderError
+from app.services.ai.live import GeminiLiveSession
 from app.services.conversation.engine import ConversationEngine
 from app.services.ielts.engine import IELTSConfig, IELTSExamSession, InvalidExamTransition
 from app.services.sessions.manager import ConversationSession, SessionManager
@@ -30,6 +32,7 @@ class RealtimeConnection:
         conversation_engine: ConversationEngine | None = None,
         persistent_conversation: Conversation | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        redis: Any | None = None,
     ) -> None:
         self.websocket = websocket
         self.session_manager = session_manager
@@ -46,11 +49,32 @@ class RealtimeConnection:
         )) if mode == "ielts" else None
         self.persistent_conversation = persistent_conversation
         self.session_factory = session_factory
+        self.redis = redis
         self.session: ConversationSession | None = None
         self.audio_buffer = bytearray()
         self.content_type = "audio/webm"
         self.processing_task: asyncio.Task[None] | None = None
         self.exam_timer_task: asyncio.Task[None] | None = None
+        self.live_session: GeminiLiveSession | None = None
+        self.live_receiver_task: asyncio.Task[None] | None = None
+        self.live_audio_open = False
+        self.live_audio_chunk_sequence = 0
+        self.live_audio_stream_sequence = 0
+        self.live_transcript = ""
+        self.live_response_text = ""
+        self.turn_started_at: float | None = None
+        self.turn_started_wall: float | None = None
+        self.turn_first_text_at: float | None = None
+        self.turn_first_audio_at: float | None = None
+        self.turn_first_audio_sent_at: float | None = None
+        self.turn_audio_sent_at: float | None = None
+        self.turn_audio_generation_complete_at: float | None = None
+        self.turn_last_chunk_sent_at: float | None = None
+        self.turn_chunk_intervals_ms: list[float] = []
+        self.turn_last_gemini_chunk_at: float | None = None
+        self.turn_gemini_chunk_intervals_ms: list[float] = []
+        self.turn_gemini_started_at: float | None = None
+        self.turn_synthesis_started_at: float | None = None
 
     async def run(self) -> None:
         await self.websocket.accept()
@@ -59,22 +83,41 @@ class RealtimeConnection:
             for message in sorted(self.persistent_conversation.messages, key=lambda item: item.sequence):
                 self.session.add_message(message.role, message.text)
             logger.info("Recovered realtime session messages=%d", len(self.session.messages))
+        transport = "live_pcm" if await self._start_live_if_enabled() else "legacy_turns"
+        logger.info("Realtime session ready mode=%s transport=%s", self.mode, transport)
         await self.websocket.send_json({
             "type": "session_ready",
             "sessionId": self.session.session_id,
             "voiceMode": self.voice_mode,
+            "transport": transport,
+            "provider": "gemini",
+            "model": self.settings.gemini_live_model if transport == "live_pcm" else self.settings.gemini_model,
+            "streamingMode": "incremental_gemini_live_pcm" if transport == "live_pcm" else "legacy_buffered_turns",
+            "latencyConfig": {
+                "sampleRateHz": 24_000,
+                "channels": 1,
+                "pcmFormat": "s16le",
+                "responsePauseMs": self.settings.response_pause_ms,
+                "fallbackProvider": self.settings.realtime_fallback_provider,
+            } if transport == "live_pcm" else None,
         })
+        await self._cache_session_state("connected")
         if self.ielts_exam:
             await self._start_ielts_exam()
             self.exam_timer_task = asyncio.create_task(self._run_exam_timer())
         try:
             while True:
                 message = await self.websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
                 if message.get("bytes") is not None:
-                    self.audio_buffer.extend(message["bytes"])
-                    if len(self.audio_buffer) > self.settings.max_audio_bytes:
-                        await self._send_error("Audio utterance is too large")
-                        self.audio_buffer.clear()
+                    if self.live_session:
+                        await self.live_session.send_audio(message["bytes"])
+                    else:
+                        self.audio_buffer.extend(message["bytes"])
+                        if len(self.audio_buffer) > self.settings.max_audio_bytes:
+                            await self._send_error("Audio utterance is too large")
+                            self.audio_buffer.clear()
                 elif message.get("text") is not None:
                     await self._handle_event(json.loads(message["text"]))
         except WebSocketDisconnect:
@@ -87,6 +130,12 @@ class RealtimeConnection:
             if self.exam_timer_task:
                 self.exam_timer_task.cancel()
                 await asyncio.gather(self.exam_timer_task, return_exceptions=True)
+            if self.live_receiver_task:
+                self.live_receiver_task.cancel()
+                await asyncio.gather(self.live_receiver_task, return_exceptions=True)
+            if self.live_session:
+                await self.live_session.close()
+            await self._cache_session_state("disconnected", delete=True)
             if self.session:
                 self.session_manager.remove(self.session.session_id)
 
@@ -96,11 +145,146 @@ class RealtimeConnection:
             await self._cancel_processing(send_event=True)
             self.audio_buffer.clear()
             self.content_type = event.get("contentType", "audio/webm")
+            if self.live_session:
+                await self.live_session.start_activity()
+                await self._cache_session_state("listening")
         elif event_type == "audio_end":
+            self._start_latency_turn()
+            if self.live_session:
+                self.turn_gemini_started_at = time.perf_counter()
+                await self.live_session.end_activity()
+                await self._cache_session_state("thinking")
+                return
             if self.processing_task is None or self.processing_task.done():
                 self.processing_task = asyncio.create_task(self._process_utterance())
         elif event_type == "close":
             await self.websocket.close()
+
+    async def _start_live_if_enabled(self) -> bool:
+        # IELTS prompts are deterministic and deliberately stay on the legacy
+        # pipeline until its live examiner state machine is migrated separately.
+        if self.settings.realtime_provider != "live" or self.mode == "ielts":
+            return False
+        try:
+            self.live_session = GeminiLiveSession(
+                self.settings,
+                system_instruction=(
+                    "You are a warm, concise English conversation partner for an English-learning app. "
+                    "Speak and write ONLY English in every response, even when the user speaks another language. "
+                    "If the user uses another language, politely invite them to continue in English. "
+                    "Respond naturally in short spoken English and let the user interrupt you."
+                ),
+            )
+            await self.live_session.connect()
+            self.live_receiver_task = asyncio.create_task(self._receive_live_events())
+            return True
+        except Exception as error:
+            self.live_session = None
+            logger.warning("Gemini Live unavailable; using %s fallback: %s", self.settings.realtime_fallback_provider, error)
+            metrics.increment("realtime.live.fallbacks")
+            return False
+
+    async def _receive_live_events(self) -> None:
+        assert self.live_session is not None
+        try:
+            async for payload in self.live_session.receive():
+                content = payload.get("serverContent", {})
+                input_transcript = content.get("inputTranscription", {}).get("text", "")
+                if input_transcript:
+                    self.live_transcript += input_transcript
+                    await self.websocket.send_json({"type": "transcript_delta", "text": input_transcript})
+                output_transcript = content.get("outputTranscription", {}).get("text", "")
+                if output_transcript:
+                    self._mark_first_text()
+                    self.live_response_text += output_transcript
+                    await self.websocket.send_json({"type": "assistant_delta", "text": output_transcript})
+                for part in content.get("modelTurn", {}).get("parts", []):
+                    inline = part.get("inlineData") or {}
+                    if inline.get("data"):
+                        mime_type = inline.get("mimeType", "audio/pcm;rate=24000").lower()
+                        if not mime_type.startswith("audio/pcm") or ("rate=" in mime_type and "rate=24000" not in mime_type):
+                            logger.error("Unsupported Gemini Live audio format mime_type=%s", mime_type)
+                            continue
+                        received_at = time.perf_counter()
+                        pcm = base64.b64decode(inline["data"], validate=True)
+                        if not pcm or len(pcm) % 2:
+                            logger.warning("Ignoring malformed Gemini Live PCM chunk bytes=%d", len(pcm))
+                            continue
+                        self._mark_first_audio(received_at)
+                        if self.turn_last_gemini_chunk_at is not None:
+                            self.turn_gemini_chunk_intervals_ms.append((received_at - self.turn_last_gemini_chunk_at) * 1000)
+                        self.turn_last_gemini_chunk_at = received_at
+                        if not self.live_audio_open:
+                            self.live_audio_open = True
+                            self.live_audio_chunk_sequence = 0
+                            self.live_audio_stream_sequence += 1
+                            await self.websocket.send_json({
+                                "type": "audio_start",
+                                "streamId": self.live_audio_stream_sequence,
+                                "streaming": True,
+                                "mimeType": "audio/pcm;rate=24000",
+                                "sampleRateHz": 24_000,
+                                "channels": 1,
+                                "pcmFormat": "s16le",
+                            })
+                        sequence = self.live_audio_chunk_sequence
+                        await self.websocket.send_json({"type": "audio_chunk", "streamId": self.live_audio_stream_sequence, "sequence": sequence})
+                        await self.websocket.send_bytes(pcm)
+                        self._mark_audio_chunk_sent()
+                        self.live_audio_chunk_sequence += 1
+                if content.get("interrupted"):
+                    if self.live_audio_open:
+                        await self._end_live_audio_stream(interrupted=True)
+                    self.live_audio_open = False
+                    await self.websocket.send_json({"type": "response_interrupted"})
+                if content.get("turnComplete"):
+                    self.turn_audio_generation_complete_at = time.perf_counter()
+                    await self._complete_live_turn()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Gemini Live receive loop failed")
+            metrics.increment("realtime.live.failures")
+            await self._send_error("Live audio connection was interrupted. Please try again.")
+
+    async def _complete_live_turn(self) -> None:
+        if self.live_audio_open:
+            await self._end_live_audio_stream()
+        transcript, response = self.live_transcript.strip(), self.live_response_text.strip()
+        self.live_transcript = ""
+        self.live_response_text = ""
+        if transcript:
+            self.session.add_message("user", transcript) if self.session else None
+            await self.websocket.send_json({"type": "transcript", "text": transcript})
+            asyncio.create_task(self._persist_message("user", transcript))
+        if response:
+            self.session.add_message("assistant", response) if self.session else None
+            await self.websocket.send_json({"type": "assistant_text", "text": response})
+            asyncio.create_task(self._persist_message("assistant", response))
+        await self.websocket.send_json({"type": "ready"})
+        await self._send_latency_report()
+        await self._cache_session_state("ready")
+
+    async def _end_live_audio_stream(self, *, interrupted: bool = False) -> None:
+        await self.websocket.send_json({
+            "type": "audio_end",
+            "streamId": self.live_audio_stream_sequence,
+            "interrupted": interrupted,
+            "chunkCount": self.live_audio_chunk_sequence,
+        })
+        self.live_audio_open = False
+
+    async def _cache_session_state(self, state: str, *, delete: bool = False) -> None:
+        if not self.redis or not self.session:
+            return
+        key = f"realtime:session:{self.session.session_id}"
+        try:
+            if delete:
+                await self.redis.delete(key)
+            else:
+                await self.redis.set(key, json.dumps({"state": state, "mode": self.mode}), ex=1800)
+        except Exception:
+            logger.debug("Redis realtime state unavailable", exc_info=True)
 
     async def _process_utterance(self) -> None:
         if not self.audio_buffer or not self.session:
@@ -121,8 +305,10 @@ class RealtimeConnection:
                 await self._handle_ielts_transcript(transcript)
                 return
             response_chunks: list[str] = []
+            self.turn_gemini_started_at = time.perf_counter()
             async for chunk in self.conversation_engine.reply_stream(self.session, transcript):
                 response_chunks.append(chunk)
+                self._mark_first_text()
                 await self.websocket.send_json({"type": "assistant_delta", "text": chunk})
             response_text = self.session.last_assistant_response
             if not response_text:
@@ -204,7 +390,9 @@ class RealtimeConnection:
         await asyncio.sleep(self.settings.response_pause_ms / 1000)
         audio_chunks: list[bytes] = []
         try:
+            self.turn_synthesis_started_at = time.perf_counter()
             async for chunk in self.ai_provider.synthesize(response_text):
+                self._mark_first_audio()
                 audio_chunks.append(chunk)
                 logger.info("TTS chunk generated bytes=%d", len(chunk))
         except GeminiProviderError as error:
@@ -223,8 +411,98 @@ class RealtimeConnection:
         await self.websocket.send_json({"type": "audio_start", "mimeType": "audio/wav", "contentType": "audio/wav"})
         for chunk in audio_chunks:
             await self.websocket.send_bytes(chunk)
+        self._mark_audio_sent()
         await self.websocket.send_json({"type": "audio_end"})
+        await self._send_latency_report()
         await self.websocket.send_json({"type": final_event})
+
+    def _start_latency_turn(self) -> None:
+        self.turn_started_at = time.perf_counter()
+        self.turn_started_wall = time.time()
+        self.turn_first_text_at = None
+        self.turn_first_audio_at = None
+        self.turn_first_audio_sent_at = None
+        self.turn_audio_sent_at = None
+        self.turn_audio_generation_complete_at = None
+        self.turn_last_chunk_sent_at = None
+        self.turn_chunk_intervals_ms = []
+        self.turn_last_gemini_chunk_at = None
+        self.turn_gemini_chunk_intervals_ms = []
+        self.turn_gemini_started_at = None
+        self.turn_synthesis_started_at = None
+        logger.info("realtime.latency event=turn_finalized ts=%.6f", self.turn_started_wall)
+
+    def _mark_first_text(self) -> None:
+        if self.turn_started_at is not None and self.turn_first_text_at is None:
+            self.turn_first_text_at = time.perf_counter()
+            logger.info("realtime.latency event=first_text elapsed_ms=%.2f", (self.turn_first_text_at - self.turn_started_at) * 1000)
+
+    def _mark_first_audio(self, received_at: float | None = None) -> None:
+        if self.turn_started_at is not None and self.turn_first_audio_at is None:
+            self.turn_first_audio_at = received_at if received_at is not None else time.perf_counter()
+            logger.info("realtime.latency event=first_audio_backend elapsed_ms=%.2f", (self.turn_first_audio_at - self.turn_started_at) * 1000)
+
+    def _mark_audio_chunk_sent(self) -> None:
+        sent_at = time.perf_counter()
+        if self.turn_first_audio_sent_at is None:
+            self.turn_first_audio_sent_at = sent_at
+            if self.turn_started_at is not None:
+                logger.info("realtime.latency event=first_audio_chunk_sent elapsed_ms=%.2f", (sent_at - self.turn_started_at) * 1000)
+        if self.turn_last_chunk_sent_at is not None:
+            interval_ms = (sent_at - self.turn_last_chunk_sent_at) * 1000
+            self.turn_chunk_intervals_ms.append(interval_ms)
+            logger.info("realtime.latency event=audio_chunk_interval ms=%.2f", interval_ms)
+        self.turn_last_chunk_sent_at = sent_at
+        self.turn_audio_sent_at = sent_at
+
+    def _mark_audio_sent(self) -> None:
+        self.turn_audio_sent_at = time.perf_counter()
+
+    async def _send_latency_report(self) -> None:
+        if self.turn_started_at is None:
+            return
+        now = time.perf_counter()
+        report = {
+            "type": "latency_metrics",
+            "endOfSpeechToTextMs": round((self.turn_first_text_at - self.turn_started_at) * 1000, 1) if self.turn_first_text_at else None,
+            "endOfSpeechToFirstAudioMs": round((self.turn_first_audio_at - self.turn_started_at) * 1000, 1) if self.turn_first_audio_at else None,
+            "endOfSpeechToFirstAudioSentMs": round((self.turn_first_audio_sent_at - self.turn_started_at) * 1000, 1) if self.turn_first_audio_sent_at else None,
+            "audioGenerationCompleteMs": round((self.turn_audio_generation_complete_at - self.turn_started_at) * 1000, 1) if self.turn_audio_generation_complete_at else None,
+            "firstGeminiAudioToGenerationCompleteMs": round((self.turn_audio_generation_complete_at - self.turn_first_audio_at) * 1000, 1) if self.turn_audio_generation_complete_at and self.turn_first_audio_at else None,
+            "geminiFirstChunkToBackendFirstSendMs": round((self.turn_first_audio_sent_at - self.turn_first_audio_at) * 1000, 1) if self.turn_first_audio_sent_at and self.turn_first_audio_at else None,
+            "lastAudioSendToGenerationCompleteMs": round((self.turn_audio_generation_complete_at - self.turn_audio_sent_at) * 1000, 1) if self.turn_audio_sent_at and self.turn_audio_generation_complete_at else None,
+            "backendChunkIntervalsMs": self.turn_chunk_intervals_ms,
+            "backendChunkIntervalStatsMs": self._duration_stats(self.turn_chunk_intervals_ms),
+            "geminiAudioChunkIntervalsMs": [round(value, 2) for value in self.turn_gemini_chunk_intervals_ms],
+            "geminiAudioChunkIntervalStatsMs": self._duration_stats(self.turn_gemini_chunk_intervals_ms),
+            "geminiRequestToFirstTextMs": round((self.turn_first_text_at - self.turn_gemini_started_at) * 1000, 1) if self.turn_first_text_at and self.turn_gemini_started_at else None,
+            "ttsRequestToFirstAudioMs": round((self.turn_first_audio_at - self.turn_synthesis_started_at) * 1000, 1) if self.turn_first_audio_at and self.turn_synthesis_started_at else None,
+            "endOfSpeechToBackendDeliveryMs": round((self.turn_audio_sent_at - self.turn_started_at) * 1000, 1) if self.turn_audio_sent_at else None,
+            "backendAudioDeliveryMs": round((self.turn_audio_sent_at - self.turn_first_audio_at) * 1000, 1) if self.turn_audio_sent_at and self.turn_first_audio_at else None,
+            "endOfSpeechToBackendCompleteMs": round((now - self.turn_started_at) * 1000, 1),
+            "serverTimestamp": time.time(),
+        }
+        logger.info("realtime.latency summary=%s", json.dumps(report, separators=(",", ":")))
+        for key, metric_name in (("endOfSpeechToTextMs", "realtime.latency.ttft"), ("endOfSpeechToFirstAudioMs", "realtime.latency.first_audio"), ("endOfSpeechToFirstAudioSentMs", "realtime.latency.first_audio_sent"), ("endOfSpeechToBackendDeliveryMs", "realtime.latency.backend_delivery"), ("endOfSpeechToBackendCompleteMs", "realtime.latency.backend_complete")):
+            value = report[key]
+            if value is not None:
+                metrics.observe(metric_name, value / 1000)
+        await self.websocket.send_json(report)
+        self.turn_started_at = None
+
+    @staticmethod
+    def _duration_stats(values: list[float]) -> dict[str, float | int | None]:
+        if not values:
+            return {"count": 0, "average": None, "minimum": None, "maximum": None, "p50": None, "p95": None}
+        ordered = sorted(values)
+        return {
+            "count": len(ordered),
+            "average": round(sum(ordered) / len(ordered), 2),
+            "minimum": round(ordered[0], 2),
+            "maximum": round(ordered[-1], 2),
+            "p50": round(ordered[max(0, (len(ordered) + 1) // 2 - 1)], 2),
+            "p95": round(ordered[max(0, int(0.95 * len(ordered) + 0.999999) - 1)], 2),
+        }
 
     async def _persist_ielts_metadata(self) -> None:
         if not self.persistent_conversation or not self.session_factory or not self.ielts_exam:
@@ -285,4 +563,7 @@ class RealtimeConnection:
         await asyncio.gather(task, return_exceptions=True)
         self.processing_task = None
         if send_event:
+            if self.live_audio_open:
+                self.live_audio_open = False
+                await self.websocket.send_json({"type": "audio_end"})
             await self.websocket.send_json({"type": "response_interrupted"})

@@ -80,6 +80,17 @@ async def get_conversation(
     return await owned_conversation(conversation_id, user, session)
 
 
+@router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    conversation_id: str,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(db_session),
+) -> None:
+    conversation = await owned_conversation(conversation_id, user, session)
+    await session.delete(conversation)
+    await session.commit()
+
+
 @router.post("/conversations/{conversation_id}/end", response_model=ConversationDetail)
 async def end_conversation(
     conversation_id: str,

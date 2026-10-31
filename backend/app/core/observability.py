@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 import time
+import math
 from typing import Any
 
 
@@ -27,7 +28,10 @@ class Metrics:
                 name: {
                     "count": len(values),
                     "average_seconds": round(sum(values) / len(values), 4) if values else 0,
+                    "min_seconds": min(values, default=0),
                     "max_seconds": max(values, default=0),
+                    "p50_seconds": _percentile(values, 0.50),
+                    "p95_seconds": _percentile(values, 0.95),
                 }
                 for name, values in self.timings.items()
             },
@@ -35,6 +39,14 @@ class Metrics:
 
 
 metrics = Metrics()
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile * len(ordered)) - 1)
+    return ordered[index]
 
 
 def cost_estimate(

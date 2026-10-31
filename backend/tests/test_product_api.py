@@ -41,6 +41,10 @@ def test_auth_conversation_history_and_profile_flow() -> None:
         assert ended.json()["duration_seconds"] == 90
         assert "Travel" in ended.json()["summary"]
 
+        deleted = client.delete(f"/api/conversations/{conversation_id}")
+        assert deleted.status_code == 204
+        assert client.get(f"/api/conversations/{conversation_id}").status_code == 404
+
         assert client.post("/api/auth/logout").status_code == 204
         assert client.get("/api/auth/me").status_code == 401
 

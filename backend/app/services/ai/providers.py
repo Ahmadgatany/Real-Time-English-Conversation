@@ -67,6 +67,13 @@ class GeminiProvider:
                 return response.json()
             except (httpx.TimeoutException, httpx.NetworkError) as error:
                 metrics.increment("gemini.generate.failures")
+                logger.warning(
+                    "Gemini network failure model=%s attempt=%d/%d error_type=%s",
+                    model,
+                    attempt + 1,
+                    self.settings.gemini_max_retries + 1,
+                    type(error).__name__,
+                )
                 if attempt >= self.settings.gemini_max_retries:
                     raise GeminiProviderError("Gemini request timed out or the network is unavailable.") from error
                 metrics.increment("gemini.generate.retries")
@@ -116,7 +123,11 @@ class GeminiProvider:
     async def respond_stream(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         payload = {
             "system_instruction": {"parts": [{
-                "text": "You are a warm, natural English conversation partner. Keep replies concise and conversational."
+                "text": (
+                    "You are a warm, natural English conversation partner in an English-learning app. "
+                    "Reply ONLY in English, even if the user uses another language; politely invite them to continue in English. "
+                    "Keep replies concise and conversational."
+                )
             }]},
             "contents": [
                 {

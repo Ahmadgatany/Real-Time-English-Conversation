@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "baseline_id": "gemini-live-historical-10-turns",
+  "source": "manually_supplied_historical_measurements",
+  "raw_turn_level_data_available": false,
+  "completed_turns": 10,
+  "collected_at": null,
+  "notes": "Historical values supplied by the user before incremental streaming changes. These are not newly collected measurements. Missing per-turn samples and metric-specific distributions are intentionally not inferred.",
+  "provider": "gemini",
+  "streaming_mode": "live_buffered_before_optimization",
+  "metrics_ms": {
+    "ttft": { "value": 901, "statistics": null },
+    "first_audio_from_gemini": { "value": 7335, "statistics": null },
+    "playback_start": { "value": 7364, "statistics": null },
+    "playback_complete": {
+      "value": 13309,
+      "statistics": {
+        "count": 10,
+        "average": 13136,
+        "minimum": 9031,
+        "maximum": 16093,
+        "p50": 13309,
+        "p95": 16093
+      }
+    }
+  }
+}

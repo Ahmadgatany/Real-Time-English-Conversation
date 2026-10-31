@@ -118,5 +118,6 @@ async def conversation_socket(websocket: WebSocket) -> None:
 		voice_mode=websocket.query_params.get("voice", "gemini"),
 		persistent_conversation=conversation,
 		session_factory=session_factory,
+		redis=websocket.app.state.redis,
 	)
 	await connection.run()

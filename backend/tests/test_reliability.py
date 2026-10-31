@@ -1,6 +1,22 @@
 import asyncio
 
 from app.services.sessions.manager import SessionManager
+from app.core.observability import Metrics
+
+
+def test_metrics_snapshot_includes_latency_percentiles() -> None:
+    observed = Metrics()
+    for value in (0.1, 0.2, 0.3, 0.4, 0.5):
+        observed.observe("turn", value)
+    summary = observed.snapshot()["timings"]["turn"]
+    assert summary == {
+        "count": 5,
+        "average_seconds": 0.3,
+        "min_seconds": 0.1,
+        "max_seconds": 0.5,
+        "p50_seconds": 0.3,
+        "p95_seconds": 0.5,
+    }
 
 
 def test_sessions_expire_when_idle(monkeypatch) -> None:

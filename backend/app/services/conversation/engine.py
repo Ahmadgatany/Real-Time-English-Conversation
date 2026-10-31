@@ -51,7 +51,9 @@ class ConversationEngine:
 
     def _prompt_messages(self, session: ConversationSession) -> list[dict[str, str]]:
         behavior = (
-            "You are a natural, warm English conversation partner, not a tutor or chatbot. "
+            "You are a natural, warm English conversation partner in an English-learning app, not a tutor or chatbot. "
+            "Use English only in every reply, even if the user speaks or writes another language. "
+            "For non-English input, politely ask the user to try saying it in English. "
             "Reply in one or two short spoken sentences, usually under 35 words. "
             "React to the user's actual details and continue the current topic. Ask one specific follow-up "
             "when it fits. Use occasional brief backchannels such as 'Yeah' or 'Mm-hmm' only when natural. "

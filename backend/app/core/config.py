@@ -8,6 +8,11 @@ class Settings:
     gemini_model: str = "gemini-3.6-flash"
     gemini_tts_model: str = "gemini-2.5-flash-preview-tts"
     gemini_tts_voice: str = "Kore"
+    realtime_provider: str = "live"
+    realtime_fallback_provider: str = "legacy"
+    gemini_live_model: str = "gemini-3.8-live"
+    gemini_transcribe_model: str = "gemini-3.5-transcribe-live"
+    gemini_live_voice: str = "Kore"
     cors_origins: tuple[str, ...] = ("http://localhost:3000",)
     max_audio_bytes: int = 15 * 1024 * 1024
     max_response_chars: int = 240
@@ -49,6 +54,11 @@ def get_settings() -> Settings:
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
         gemini_tts_model=os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"),
         gemini_tts_voice=os.getenv("GEMINI_TTS_VOICE", "Kore"),
+        realtime_provider=os.getenv("REALTIME_PROVIDER", "live").lower(),
+        realtime_fallback_provider=os.getenv("REALTIME_FALLBACK_PROVIDER", "legacy").lower(),
+        gemini_live_model=os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live"),
+        gemini_transcribe_model=os.getenv("GEMINI_TRANSCRIBE_MODEL", "gemini-3.5-transcribe-live"),
+        gemini_live_voice=os.getenv("GEMINI_LIVE_VOICE", os.getenv("GEMINI_TTS_VOICE", "Kore")),
         cors_origins=origins or ("http://localhost:3000",),
         max_audio_bytes=int(os.getenv("MAX_AUDIO_BYTES", str(15 * 1024 * 1024))),
         max_response_chars=int(os.getenv("MAX_RESPONSE_CHARS", "240")),

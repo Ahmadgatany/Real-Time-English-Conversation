@@ -71,7 +71,7 @@ Set `NEXT_PUBLIC_API_URL=http://localhost:8000` and `NEXT_PUBLIC_WS_URL=ws://loc
 
 Set `NEXT_PUBLIC_WS_URL` in `frontend/.env.local` when the API is not running at `ws://localhost:8000/ws/conversation`.
 
-Phase 2 automatically starts the next listening turn after the assistant finishes. If the user speaks while the assistant is speaking, the browser stops playback and starts a new turn. Tune `NEXT_PUBLIC_VAD_THRESHOLD`, `NEXT_PUBLIC_INTERRUPTION_THRESHOLD`, and `NEXT_PUBLIC_VAD_SILENCE_MS` in `frontend/.env.local` for microphone and room noise. Backend response behavior can be tuned with `MAX_RESPONSE_CHARS`, `RESPONSE_PAUSE_MS`, `VAD_SILENCE_MS`, and `INTERRUPTION_THRESHOLD` in `backend/.env`.
+Each turn is controlled manually: select **Speak** to begin recording, then select **Finish & respond** when you have completed your answer. Recording never stops because of silence, and the microphone does not reopen automatically after the assistant responds. Backend response behavior can be tuned with `MAX_RESPONSE_CHARS` and `RESPONSE_PAUSE_MS` in `backend/.env`.
 
 ### Checks
 

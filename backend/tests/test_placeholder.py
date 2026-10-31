@@ -33,6 +33,12 @@ class FakeWebSocket:
     async def send_json(self, event: dict[str, str]) -> None:
         self.events.append(event)
 
+    async def accept(self) -> None:
+        pass
+
+    async def receive(self) -> dict[str, str]:
+        return {"type": "websocket.disconnect"}
+
 
 def test_session_manager_creates_and_removes_sessions() -> None:
     manager = SessionManager()
@@ -71,6 +77,7 @@ def test_websocket_processes_audio_turn(monkeypatch) -> None:
             }
             assert websocket.receive_bytes() == b"audio-response"
             assert websocket.receive_json()["type"] == "audio_end"
+            assert websocket.receive_json()["type"] == "latency_metrics"
             assert websocket.receive_json()["type"] == "ready"
 
 
@@ -84,5 +91,14 @@ def test_realtime_connection_interrupts_active_response() -> None:
 
         assert connection.processing_task is None
         assert socket.events == [{"type": "response_interrupted"}]
+
+    asyncio.run(scenario())
+
+
+def test_websocket_disconnect_ends_receive_loop_cleanly() -> None:
+    async def scenario() -> None:
+        connection = RealtimeConnection(FakeWebSocket(), SessionManager(), FakeProvider())
+        await connection.run()
+        assert connection.session is None
 
     asyncio.run(scenario())

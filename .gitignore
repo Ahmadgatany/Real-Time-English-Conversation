@@ -1,12 +1,58 @@
-# Environment
+# Environment and credentials
 .env
 .env.*
 !.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets.*
+credentials.*
+
+# Local databases and database sidecars
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.sqlite-journal
+*.sqlite3-journal
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Local benchmark exports and generated runs (keep baseline and documentation)
+benchmarks/latency/runs/
+benchmarks/latency/latency-export-*.json
 
 # Node
 node_modules/
 .next/
 out/
+dist/
+build/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Python
 __pycache__/
@@ -16,8 +62,14 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
+htmlcov/
+site-packages/
 
 # Tooling
 .vscode/
 coverage/
 .DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
